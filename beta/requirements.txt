@@ -1,0 +1,3 @@
+openai==0.27.0
+telethon==1.24.0
+metaapi-cloud-sdk==8.0.0

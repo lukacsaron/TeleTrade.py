@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Close Orders</title>
+    <style>
+        .highlight {
+            animation: highlight-animation 1s;
+        }
+        
+        @keyframes highlight-animation {
+            from { background-color: #fffbcc; }
+            to { background-color: transparent; }
+        }
+
+        #notification-log {
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin: 10px;
+            height: 300px;
+            overflow-y: auto;
+        }
+
+        #notification-log p {
+            margin: 5px 0;
+        }
+    </style>
+    <script>
+        async function fetchTradesAndOrders() {
+            const response = await fetch('/trades_and_orders');
+            const data = await response.json();
+            return data;
+        }
+
+        function updateTable(data) {
+            const ongoingTradesTable = document.getElementById('ongoing-trades');
+            const openOrdersTable = document.getElementById('open-orders');
+            
+            ongoingTradesTable.innerHTML = '';
+            openOrdersTable.innerHTML = '';
+
+            data.ongoing_trades.forEach(trade => {
+                const row = ongoingTradesTable.insertRow();
+                row.classList.add('highlight');
+                row.insertCell(0).innerHTML = trade.order_id;
+                row.insertCell(1).innerHTML = trade.symbol;
+                row.insertCell(2).innerHTML = trade.time;
+                row.insertCell(3).innerHTML = trade.entry_price;
+                row.insertCell(4).innerHTML = trade.current_pl;
+                row.insertCell(5).innerHTML = trade.volume;
+                const closeButtonCell = row.insertCell(6);
+                const closeButton = document.createElement('button');
+                closeButton.innerHTML = 'Close';
+                closeButton.onclick = async () => {
+                    const response = await fetch(`/close_position/${trade.order_id}`, { method: 'POST' });
+                    if (response.ok) {
+                        addNotification(`Position ${trade.order_id} closed successfully`);
+                        const data = await fetchTradesAndOrders();
+                        updateTable(data);
+                    } else {
+                        addNotification(`Failed to close position ${trade.order_id}`);
+                    }
+                };
+                closeButtonCell.appendChild(closeButton);
+            });
+
+            data.open_orders.forEach(order => {
+                const row = openOrdersTable.insertRow();
+                row.classList.add('highlight');
+                row.insertCell(0).innerHTML = order.order_id;
+                row.insertCell(1).innerHTML = order.symbol;
+                row.insertCell(2).innerHTML = order.time;
+                row.insertCell(3).innerHTML = order.entry_price;
+                row.insertCell(4).innerHTML = order.current_pl;
+                row.insertCell(5).innerHTML = order.volume;
+                const closeButtonCell = row.insertCell(6);
+                const closeButton = document.createElement('button');
+                closeButton.innerHTML = 'Close';
+                closeButton.onclick = async () => {
+                    const response = await fetch(`/close_order/${order.order_id}`, { method: 'POST' });
+                    if (response.ok) {
+                        addNotification(`Order ${order.order_id} closed successfully`);
+                        const data = await fetchTradesAndOrders();
+                        updateTable(data);
+                    } else {
+                        addNotification(`Failed to close order ${order.order_id}`);
+                    }
+                };
+                closeButtonCell.appendChild(closeButton);
+            });
+        }
+
+        function startTimer() {
+            let timeLeft = 2.5;
+            const timer = document.getElementById('timer');
+            const interval = setInterval(async () => {
+                if (timeLeft <= 0) {
+                    clearInterval(interval);
+                    const data = await fetchTradesAndOrders();
+                    updateTable(data);
+                    startTimer();
+                } else {
+                    timer.innerHTML = `Next refresh in ${timeLeft.toFixed(1)} seconds`;
+                    timeLeft -= 0.1;
+                }
+            }, 100);
+        }
+
+        function addNotification(message) {
+            const notificationLog = document.getElementById('notification-log');
+            const newNotification = document.createElement('p');
+            newNotification.textContent = message;
+            notificationLog.appendChild(newNotification);
+            notificationLog.scrollTop = notificationLog.scrollHeight;
+        }
+
+        async function closeOrders(event) {
+            event.preventDefault();
+            const response = await fetch('/close_orders', { method: 'POST' });
+            if (response.ok) {
+                addNotification('All orders closed successfully');
+                const data = await fetchTradesAndOrders();
+                updateTable(data);
+            } else {
+                addNotification('Failed to close orders');
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            const data = await fetchTradesAndOrders();
+            updateTable(data);
+            startTimer();
+
+            const form = document.querySelector('form');
+            form.addEventListener('submit', closeOrders);
+        });
+    </script>
+</head>
+<body>
+    <h1>Close Orders</h1>
+    <div style="display: flex;">
+        <div style="flex: 3;">
+            <form action="/close_orders" method="post">
+                <button type="submit">Close All Orders</button>
+            </form>
+            <p id="timer">Next refresh in 2.5 seconds</p>
+            <h2>Ongoing Trades (Filled Orders)</h2>
+            <table border="1">
+                <thead>
+                    <tr>
+                        <th>Order ID</th>
+                        <th>Symbol</th>
+                        <th>Time</th>
+                        <th>Entry Price</th>
+                        <th>Current P&L</th>
+                        <th>Volume</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="ongoing-trades"></tbody>
+            </table>
+            <h2>Open Orders (Unfilled Orders)</h2>
+            <table border="1">
+                <thead>
+                    <tr>
+                        <th>Order ID</th>
+                        <th>Symbol</th>
+                        <th>Time</th>
+                        <th>Entry Price</th>
+                        <th>Current P&L</th>
+                        <th>Volume</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="open-orders"></tbody>
+            </table>
+        </div>
+        <div style="flex: 1; padding-left: 20px;">
+            <h2>Notification Log</h2>
+            <div id="notification-log"></div>
+        </div>
+    </div>
+</body>
+</html>
