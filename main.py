@@ -2,6 +2,7 @@ import json
 import base64
 import openai
 import asyncio
+import sqlite3
 from telethon import TelegramClient, events
 from datetime import datetime
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
@@ -9,6 +10,54 @@ from metaapi_cloud_sdk import MetaApi
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
+
+DATABASE = 'trades.db'
+
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS trades (
+                        trade_id INTEGER PRIMARY KEY,
+                        action TEXT,
+                        symbol TEXT,
+                        entry_price_low REAL,
+                        entry_price_high REAL,
+                        sl REAL,
+                        tp1 REAL,
+                        tp2 REAL,
+                        status TEXT
+                      )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS entries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        trade_id INTEGER,
+                        entry REAL,
+                        tp REAL,
+                        sl REAL,
+                        volume REAL,
+                        order_type TEXT,
+                        order_id TEXT,
+                        status TEXT,
+                        FOREIGN KEY(trade_id) REFERENCES trades(trade_id)
+                      )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS filled_entries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        trade_id INTEGER,
+                        order_id TEXT,
+                        entry REAL,
+                        tp REAL,
+                        sl REAL,
+                        volume REAL,
+                        order_type TEXT,
+                        status TEXT,
+                        FOREIGN KEY(trade_id) REFERENCES trades(trade_id)
+                      )''')
+    conn.commit()
+    conn.close()
 
 class Trade:
     def __init__(self, trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, entries=None, filled_entries=None, status="open"):
@@ -153,7 +202,6 @@ async def place_orders(account, trade):
         print(f"Error placing trade: {e}")
         return False
 
-
 def default(obj):
     if isinstance(obj, datetime):
         return obj.isoformat()
@@ -169,36 +217,43 @@ def default(obj):
         raise TypeError(f"Type {obj} not serializable")
 
 def save_trade(trade):
-    try:
-        with open('trades.json', 'r') as f:
-            trades = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        trades = []
+    conn = get_db()
+    cursor = conn.cursor()
 
-    if not isinstance(trades, list):
-        trades = []
+    cursor.execute('''INSERT OR REPLACE INTO trades (trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, status)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                   (trade.trade_id, trade.action, trade.symbol, trade.entry_price_low, trade.entry_price_high, trade.sl, trade.tp1, trade.tp2, trade.status))
 
-    for i, t in enumerate(trades):
-        if 'trade_id' in t and t['trade_id'] == trade.trade_id:
-            trades[i] = trade.to_dict()
-            break
-    else:
-        trades.append(trade.to_dict())
+    cursor.execute('DELETE FROM entries WHERE trade_id = ?', (trade.trade_id,))
+    for entry in trade.entries:
+        cursor.execute('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                       (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
 
-    with open('trades.json', 'w') as f:
-        json.dump(trades, f, default=default, indent=4)
+    cursor.execute('DELETE FROM filled_entries WHERE trade_id = ?', (trade.trade_id,))
+    for filled_entry in trade.filled_entries:
+        cursor.execute('''INSERT INTO filled_entries (trade_id, order_id, entry, tp, sl, volume, order_type, status)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                       (trade.trade_id, filled_entry['order_id'], filled_entry['entry'], filled_entry['tp'], filled_entry['sl'], filled_entry['volume'], filled_entry['order_type'], filled_entry['status']))
+
+    conn.commit()
+    conn.close()
 
 def update_status(trade_id):
-    with open('status.json', 'w') as f:
-        json.dump({'latest_trade_id': trade_id}, f)
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM status')
+    cursor.execute('INSERT INTO status (latest_trade_id) VALUES (?)', (trade_id,))
+    conn.commit()
+    conn.close()
 
 def get_latest_trade_id():
-    try:
-        with open('status.json', 'r') as f:
-            status = json.load(f)
-            return status.get('latest_trade_id')
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT latest_trade_id FROM status LIMIT 1')
+    result = cursor.fetchone()
+    conn.close()
+    return result['latest_trade_id'] if result else None
 
 async def interpret_message(text):
     try:
@@ -313,35 +368,54 @@ async def place_additional_market_order(account, trade):
 
 async def close_all_orders(account, trade_id):
     try:
-        with open('trades.json', 'r') as f:
-            trades = json.load(f)
+        conn = get_db()
+        cursor = conn.cursor()
 
-        trade = next((t for t in trades if t['trade_id'] == trade_id), None)
-        if not trade:
+        cursor.execute('SELECT * FROM trades WHERE trade_id = ?', (trade_id,))
+        trade_row = cursor.fetchone()
+
+        if not trade_row:
             print(f"No trade found with trade_id: {trade_id}")
             return
+
+        trade = Trade(
+            trade_id=trade_row['trade_id'],
+            action=trade_row['action'],
+            symbol=trade_row['symbol'],
+            entry_price_low=trade_row['entry_price_low'],
+            entry_price_high=trade_row['entry_price_high'],
+            sl=trade_row['sl'],
+            tp1=trade_row['tp1'],
+            tp2=trade_row['tp2'],
+            status=trade_row['status']
+        )
+
+        cursor.execute('SELECT * FROM entries WHERE trade_id = ?', (trade_id,))
+        trade.entries = cursor.fetchall()
+
+        cursor.execute('SELECT * FROM filled_entries WHERE trade_id = ?', (trade_id,))
+        trade.filled_entries = cursor.fetchall()
 
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized()
 
-        for entry in trade['entries']:
+        for entry in trade.entries:
             order_id = entry['order_id']
             if order_id:
                 print(f"Closing order: {order_id}")
                 await connection.cancel_order(order_id)
                 entry['status'] = 'closed'
 
-        for filled_entry in trade['filled_entries']:
+        for filled_entry in trade.filled_entries:
             order_id = filled_entry['order_id']
             if order_id:
                 print(f"Closing filled order: {order_id}")
                 await connection.close_position(order_id)
                 filled_entry['status'] = 'closed'
 
-        trade['status'] = 'closed'
-        with open('trades.json', 'w') as f:
-            json.dump(trades, f, default=default, indent=4)
+        trade.status = 'closed'
+        save_trade(trade)
         
         print(f"All orders for trade_id {trade_id} closed successfully")
     except Exception as e:
@@ -496,4 +570,5 @@ def run():
     loop.run_until_complete(main())
 
 if __name__ == "__main__":
+    init_db()
     run()
