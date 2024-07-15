@@ -8,6 +8,7 @@ from datetime import datetime
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 from metaapi_cloud_sdk import MetaApi
 from flask import Flask, render_template, request, jsonify
+from asyncio import ensure_future, sleep
 
 app = Flask(__name__)
 
@@ -44,55 +45,34 @@ def init_db():
                         status TEXT,
                         FOREIGN KEY(trade_id) REFERENCES trades(trade_id)
                       )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS filled_entries (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        trade_id INTEGER,
-                        order_id TEXT,
-                        entry REAL,
-                        tp REAL,
-                        sl REAL,
-                        volume REAL,
-                        order_type TEXT,
-                        status TEXT,
-                        FOREIGN KEY(trade_id) REFERENCES trades(trade_id)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS status (
+                        latest_trade_id INTEGER
                       )''')
     conn.commit()
     conn.close()
 
 class Trade:
-    def __init__(self, trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, entries=None, filled_entries=None, status="open"):
+    def __init__(self, trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, entries=None, status="open"):
         self.trade_id = trade_id
         self.action = action
         self.symbol = symbol
-        self.entry_price_low = entry_price_low
-        self.entry_price_high = entry_price_high
-        self.sl = sl
-        self.tp1 = tp1
-        self.tp2 = tp2
+        self.entry_price_low = round(entry_price_low, 2)
+        self.entry_price_high = round(entry_price_high, 2)
+        self.sl = round(sl, 2)
+        self.tp1 = round(tp1, 2)
+        self.tp2 = round(tp2, 2)
         self.entries = entries if entries else []
-        self.filled_entries = filled_entries if filled_entries else []
         self.status = status
 
     def add_entry(self, entry, tp, sl, volume, order_type="limit"):
         self.entries.append({
-            'entry': entry,
-            'tp': tp,
-            'sl': sl,
-            'volume': volume,
+            'entry': round(entry, 2),
+            'tp': round(tp, 2),
+            'sl': round(sl, 2),
+            'volume': round(volume, 2),
             'order_type': order_type,
             'order_id': None,
             'status': 'open'
-        })
-
-    def add_market_order(self, order_id, entry, tp, sl, volume):
-        self.filled_entries.append({
-            'order_id': order_id,
-            'entry': entry,
-            'tp': tp,
-            'sl': sl,
-            'volume': volume,
-            'order_type': 'market',
-            'status': 'filled'
         })
 
     def to_dict(self):
@@ -106,7 +86,6 @@ class Trade:
             'tp1': self.tp1,
             'tp2': self.tp2,
             'entries': self.entries,
-            'filled_entries': self.filled_entries,
             'status': self.status
         }
 
@@ -146,7 +125,7 @@ async def get_current_price(account, symbol):
         await connection.connect()
         await connection.wait_synchronized()
         price = await connection.get_symbol_price(symbol)
-        return price['bid'] if price else None
+        return round(price['bid'], 2) if price else None
     except Exception as e:
         print(f"Error fetching current price: {e}")
         return None
@@ -170,7 +149,6 @@ async def place_orders(account, trade):
             def switch_order_type(order_type):
                 return "stop" if order_type == "limit" else "limit"
 
-            # Try to place the order
             def print_order_info(order_type, result):
                 print(f"Placing {trade.action.capitalize()} {order_type} order: symbol={trade.symbol}, volume={volume}, entry_price={entry_price}, sl={sl}, tp={tp}")
                 if 'orderId' in result:
@@ -201,6 +179,41 @@ async def place_orders(account, trade):
     except Exception as e:
         print(f"Error placing trade: {e}")
         return False
+    
+async def check_orders_and_positions(account):
+    while True:
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+
+            cursor.execute('SELECT * FROM trades ORDER BY trade_id DESC LIMIT 5')
+            recent_trades = cursor.fetchall()
+
+            for trade_row in recent_trades:
+                trade_id = trade_row['trade_id']
+                cursor.execute('SELECT * FROM entries WHERE trade_id = ?', (trade_id,))
+                entries = cursor.fetchall()
+
+                connection = account.get_rpc_connection()
+                await connection.connect()
+                await connection.wait_synchronized()
+
+                for entry in entries:
+                    order_id = entry['order_id']
+                    if order_id:
+                        order_status = await connection.get_order(order_id)
+                        if order_status:
+                            entry_status = 'filled' if order_status['filledVolume'] > 0 else 'open'
+                            cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry_status, entry['id']))
+                        else:
+                            cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+
+                conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error checking orders and positions: {e}")
+
+        await sleep(2.5)
 
 def default(obj):
     if isinstance(obj, datetime):
@@ -229,12 +242,6 @@ def save_trade(trade):
         cursor.execute('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                        (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
-
-    cursor.execute('DELETE FROM filled_entries WHERE trade_id = ?', (trade.trade_id,))
-    for filled_entry in trade.filled_entries:
-        cursor.execute('''INSERT INTO filled_entries (trade_id, order_id, entry, tp, sl, volume, order_type, status)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                       (trade.trade_id, filled_entry['order_id'], filled_entry['entry'], filled_entry['tp'], filled_entry['sl'], filled_entry['volume'], filled_entry['order_type'], filled_entry['status']))
 
     conn.commit()
     conn.close()
@@ -362,7 +369,7 @@ async def place_additional_market_order(account, trade):
 
     if 'orderId' in result:
         order_id = result['orderId']
-        trade.add_market_order(order_id, current_price, tp, sl, volume)
+        trade.add_entry(current_price, tp, sl, volume, order_type='market')
         save_trade(trade)
         print(f"Placed additional market order: {result}")
 
@@ -393,9 +400,6 @@ async def close_all_orders(account, trade_id):
         cursor.execute('SELECT * FROM entries WHERE trade_id = ?', (trade_id,))
         trade.entries = cursor.fetchall()
 
-        cursor.execute('SELECT * FROM filled_entries WHERE trade_id = ?', (trade_id,))
-        trade.filled_entries = cursor.fetchall()
-
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized()
@@ -406,13 +410,6 @@ async def close_all_orders(account, trade_id):
                 print(f"Closing order: {order_id}")
                 await connection.cancel_order(order_id)
                 entry['status'] = 'closed'
-
-        for filled_entry in trade.filled_entries:
-            order_id = filled_entry['order_id']
-            if order_id:
-                print(f"Closing filled order: {order_id}")
-                await connection.close_position(order_id)
-                filled_entry['status'] = 'closed'
 
         trade.status = 'closed'
         save_trade(trade)
@@ -491,6 +488,42 @@ async def fetch_open_orders(account):
         print(f"Error fetching open orders: {e}")
         return []
 
+async def update_trade_status(account, trade_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM entries WHERE trade_id = ?', (trade_id,))
+    entries = cursor.fetchall()
+    
+    connection = account.get_rpc_connection()
+    await connection.connect()
+    await connection.wait_synchronized()
+    
+    for entry in entries:
+        if entry['status'] == 'open':
+            order = await connection.get_order(entry['order_id'])
+            if order:
+                if order['state'] == 'filled':
+                    entry['status'] = 'filled'
+                elif order['state'] == 'cancelled':
+                    entry['status'] = 'closed'
+    
+    for entry in entries:
+        cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry['status'], entry['id']))
+    
+    conn.commit()
+    conn.close()
+
+async def update_recent_trades(account):
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT trade_id FROM trades ORDER BY trade_id DESC LIMIT 5')
+    recent_trades = cursor.fetchall()
+    
+    for trade in recent_trades:
+        await update_trade_status(account, trade['trade_id'])
+
 @app.route('/')
 async def index():
     return render_template('index.html')
@@ -500,6 +533,8 @@ async def trades_and_orders():
     account = await connect_metaapi()
     if not account:
         return jsonify({'ongoing_trades': [], 'open_orders': []})
+    
+    await update_recent_trades(account)
     
     ongoing_trades = await fetch_positions(account)
     open_orders = await fetch_open_orders(account)
@@ -566,8 +601,14 @@ async def main():
 
 def run():
     loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, app.run, '0.0.0.0', 8888)
-    loop.run_until_complete(main())
+    app_task = loop.run_in_executor(None, app.run, '0.0.0.0', 8888)
+    telegram_task = ensure_future(main())
+
+    account = loop.run_until_complete(connect_metaapi())
+    if account:
+        checker_task = ensure_future(check_orders_and_positions(account))
+
+    loop.run_until_complete(asyncio.gather(app_task, telegram_task))
 
 if __name__ == "__main__":
     init_db()
