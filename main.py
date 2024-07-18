@@ -47,7 +47,9 @@ def init_db():
                         sl REAL,
                         tp1 REAL,
                         tp2 REAL,
-                        status TEXT
+                        status TEXT,
+                        market1_id TEXT,
+                        market2_id TEXT
                       )''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS entries (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,6 +80,8 @@ class Trade:
         self.tp2 = round(tp2, 2)
         self.entries = entries if entries else []
         self.status = status
+        self.market1_id = None
+        self.market2_id = None
 
     def add_entry(self, entry, tp, sl, volume, order_type="limit"):
         self.entries.append({
@@ -101,7 +105,9 @@ class Trade:
             'tp1': self.tp1,
             'tp2': self.tp2,
             'entries': self.entries,
-            'status': self.status
+            'status': self.status,
+            'market1_id': self.market1_id,
+            'market2_id': self.market2_id
         }
 
 # Load configuration from config.json
