@@ -189,7 +189,7 @@ async def check_orders_and_positions(account):
             conn = get_db()
             cursor = conn.cursor()
 
-            cursor.execute('SELECT * FROM trades ORDER BY trade_id DESC LIMIT 5')
+            cursor.execute('SELECT * FROM trades WHERE status = "open" ORDER BY trade_id DESC LIMIT 5')
             recent_trades = cursor.fetchall()
 
             for trade_row in recent_trades:
@@ -201,26 +201,61 @@ async def check_orders_and_positions(account):
                 await connection.connect()
                 await connection.wait_synchronized()
 
+                all_closed = True
                 for entry in entries:
+                    if entry['status'] == 'closed' or entry['status'] == 'filled':
+                        continue
+
                     order_id = entry['order_id']
                     if order_id:
                         try:
                             print(f"Checking order {order_id}")
                             order_status = await connection.get_order(order_id)
-                            print(f"Order status for {order_id}: {order_status}")
                             if order_status:
                                 entry_status = 'filled' if 'filledVolume' in order_status and order_status['filledVolume'] > 0 else 'open'
                                 cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry_status, entry['id']))
                                 print(f"Updated entry status for {order_id} to {entry_status}")
+                                if entry_status == 'open':
+                                    all_closed = False
                             else:
-                                cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
-                                print(f"Order {order_id} is closed")
+                                print(f"Order {order_id} not found in orders, checking positions")
+                                positions = await connection.get_positions()
+                                found_position = False
+                                for pos in positions:
+                                    if pos['id'] == order_id:
+                                        entry_status = 'filled'
+                                        cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry_status, entry['id']))
+                                        print(f"Order {order_id} is filled and now a position")
+                                        found_position = True
+                                        break
+                                if not found_position:
+                                    cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                                    print(f"Order {order_id} is closed")
                         except Exception as e:
                             if "Order with specified id not found" in str(e):
-                                cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
-                                print(f"Order {order_id} not found, marking as closed")
+                                print(f"Order {order_id} not found in orders, checking positions")
+                                positions = await connection.get_positions()
+                                found_position = False
+                                for pos in positions:
+                                    if pos['id'] == order_id:
+                                        entry_status = 'filled'
+                                        cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry_status, entry['id']))
+                                        print(f"Order {order_id} is filled and now a position")
+                                        found_position = True
+                                        break
+                                if not found_position:
+                                    cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                                    print(f"Order {order_id} is closed")
                             else:
                                 print(f"Error checking order {order_id}: {e}")
+                                all_closed = False
+                    else:
+                        cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                        print(f"Market order without order_id, marking as closed")
+
+                if all_closed:
+                    cursor.execute('UPDATE trades SET status = ? WHERE trade_id = ?', ('closed', trade_id))
+                    print(f"All orders for trade {trade_id} are closed, marking trade as closed")
 
                 conn.commit()
             conn.close()
@@ -228,6 +263,7 @@ async def check_orders_and_positions(account):
             print(f"Error checking orders and positions: {e}")
 
         await sleep(2.5)
+
 
 def default(obj):
     if isinstance(obj, datetime):
@@ -392,11 +428,11 @@ async def place_additional_market_order(account, trade):
         if 'orderId' in result:
             order_id = result['orderId']
             trade.add_entry(current_price, tp, sl, volume, order_type='market')
+            trade.entries[-1]['order_id'] = order_id
             await save_trade(trade)
             print(f"Placed additional market order: {result}")
     except metaapi_cloud_sdk.clients.error_handler.ValidationException as e:
         print(f"Error placing additional market order: {e}")
-        
 
 async def close_all_orders(account, trade_id):
     try:
@@ -524,6 +560,7 @@ async def update_trade_status(account, trade_id):
     await connection.connect()
     await connection.wait_synchronized()
     
+    all_closed = True
     for entry in entries:
         if entry['status'] == 'open':
             order = await connection.get_order(entry['order_id'])
@@ -532,9 +569,15 @@ async def update_trade_status(account, trade_id):
                     entry['status'] = 'filled'
                 elif order['state'] == 'cancelled':
                     entry['status'] = 'closed'
+                else:
+                    all_closed = False
     
     for entry in entries:
         cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry['status'], entry['id']))
+
+    if all_closed:
+        cursor.execute('UPDATE trades SET status = ? WHERE trade_id = ?', ('closed', trade_id))
+        print(f"All orders for trade {trade_id} are closed, marking trade as closed")
     
     conn.commit()
     conn.close()
