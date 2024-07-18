@@ -455,7 +455,7 @@ async def interpret_message(text):
         print(f"OpenAI parsed response: {details}")
         return details
     except openai.error.RateLimitError:
-        print("Rate limit exceeded. Waiting before retrying...")
+        print("Rate limit exceeded. Waitinx0g before retrying...")
         await asyncio.sleep(60)
         return await interpret_message(text)
     except Exception as e:
@@ -465,7 +465,7 @@ async def interpret_message(text):
 def parse_trade_message(details, trade_id):
     try:
         action = details['action']
-        symbol = "BTCUSD"
+        symbol = "XAUUSD+"
         entry_price_low = details['entry_price_low']
         entry_price_high = details['entry_price_high']
         sl = details['sl']
