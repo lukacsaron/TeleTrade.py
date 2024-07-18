@@ -11,15 +11,29 @@ from metaapi_cloud_sdk import MetaApi
 from flask import Flask, render_template, request, jsonify
 from asyncio import ensure_future, sleep
 import os
+import threading
 
 app = Flask(__name__)
 
 DATABASE = 'trades.db'
 
+class Database:
+    _instance = None
+    _lock = threading.Lock()
+
+    @staticmethod
+    def get_instance():
+        if Database._instance is None:
+            with Database._lock:
+                if Database._instance is None:
+                    Database._instance = sqlite3.connect(DATABASE, timeout=10, check_same_thread=False)
+                    Database._instance.row_factory = sqlite3.Row
+        return Database._instance
+
+db_conn = Database.get_instance()
+
 def get_db():
-    conn = sqlite3.connect(DATABASE, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return db_conn
 
 def init_db():
     conn = get_db()
@@ -51,7 +65,6 @@ def init_db():
                         latest_trade_id INTEGER
                       )''')
     conn.commit()
-    conn.close()
 
 class Trade:
     def __init__(self, trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, entries=None, status="open"):
@@ -282,16 +295,19 @@ async def check_orders_and_positions(account):
                             print(f"Canceled open order {entry['order_id']} for trade {trade_id}")
 
                 if all_closed:
-                    cursor.execute('UPDATE trades SET status = ? WHERE trade_id = ?', ('closed', trade_id))
-                    print(f"All orders for trade {trade_id} are closed, marking trade as closed")
+                    all_filled = all(entry['status'] == 'filled' for entry in entries)
+                    if all_filled:
+                        cursor.execute('UPDATE trades SET status = ? WHERE trade_id = ?', ('filled', trade_id))
+                        print(f"All orders for trade {trade_id} are filled, marking trade as filled")
+                    else:
+                        cursor.execute('UPDATE trades SET status = ? WHERE trade_id = ?', ('closed', trade_id))
+                        print(f"All orders for trade {trade_id} are closed, marking trade as closed")
 
                 conn.commit()
-            conn.close()
         except Exception as e:
             print(f"Error checking orders and positions: {e}")
 
         await sleep(2.5)
-
 
 def default(obj):
     if isinstance(obj, datetime):
@@ -319,10 +335,9 @@ async def execute_with_retry(sql, params):
         except OperationalError as e:
             if 'database is locked' in str(e) and attempt < retries - 1:
                 print(f"Database is locked, retrying... ({attempt + 1}/{retries})")
-                await sleep(0.5)
+                await sleep(0.5 * (2 ** attempt))  # Exponential backoff
             else:
                 raise
-    conn.close()
 
 async def save_trade(trade):
     await execute_with_retry('''INSERT OR REPLACE INTO trades (trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, status)
@@ -344,7 +359,6 @@ def get_latest_trade_id():
     cursor = conn.cursor()
     cursor.execute('SELECT latest_trade_id FROM status LIMIT 1')
     result = cursor.fetchone()
-    conn.close()
     return result['latest_trade_id'] if result else None
 
 async def interpret_message(text):
@@ -608,7 +622,6 @@ async def update_trade_status(account, trade_id):
         print(f"All orders for trade {trade_id} are closed, marking trade as closed")
     
     conn.commit()
-    conn.close()
 
 async def update_recent_trades(account):
     conn = get_db()
@@ -716,7 +729,5 @@ def run():
         loop.run_until_complete(asyncio.gather(app_task, telegram_task))
 
 if __name__ == "__main__":
-    if os.path.exists(DATABASE):
-        os.remove(DATABASE)
     init_db()
     run()
