@@ -194,6 +194,7 @@ async def check_orders_and_positions(account):
 
             for trade_row in recent_trades:
                 trade_id = trade_row['trade_id']
+                entry_price_low = trade_row['entry_price_low']
                 cursor.execute('SELECT * FROM entries WHERE trade_id = ?', (trade_id,))
                 entries = cursor.fetchall()
 
@@ -202,6 +203,8 @@ async def check_orders_and_positions(account):
                 await connection.wait_synchronized()
 
                 all_closed = True
+                tp1_reached = False
+
                 for entry in entries:
                     if entry['status'] == 'closed' or entry['status'] == 'filled':
                         continue
@@ -252,6 +255,31 @@ async def check_orders_and_positions(account):
                     else:
                         cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
                         print(f"Market order without order_id, marking as closed")
+
+                # Check if any position with TP1 is closed
+                positions = await connection.get_positions()
+                for pos in positions:
+                    for entry in entries:
+                        if entry['tp'] == trade_row['tp1'] and entry['status'] == 'filled' and pos['id'] == entry['order_id']:
+                            if pos['unrealizedProfit'] >= (trade_row['tp1'] - entry_price_low) * pos['volume']:
+                                tp1_reached = True
+                                break
+                    if tp1_reached:
+                        break
+
+                if tp1_reached:
+                    print(f"TP1 reached for trade {trade_id}. Setting SL to BE and canceling open orders.")
+                    for pos in positions:
+                        if trade_row['symbol'] == pos['symbol']:
+                            new_sl = pos['openPrice']
+                            await connection.modify_position(pos['id'], stop_loss=new_sl)
+                            print(f"Set SL to BE for position {pos['id']} at {new_sl}")
+
+                    for entry in entries:
+                        if entry['status'] == 'open':
+                            await connection.cancel_order(entry['order_id'])
+                            cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                            print(f"Canceled open order {entry['order_id']} for trade {trade_id}")
 
                 if all_closed:
                     cursor.execute('UPDATE trades SET status = ? WHERE trade_id = ?', ('closed', trade_id))
