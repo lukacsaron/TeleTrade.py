@@ -3,19 +3,21 @@ import base64
 import openai
 import asyncio
 import sqlite3
+from sqlite3 import OperationalError
 from telethon import TelegramClient, events
 from datetime import datetime
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 from metaapi_cloud_sdk import MetaApi
 from flask import Flask, render_template, request, jsonify
 from asyncio import ensure_future, sleep
+import os
 
 app = Flask(__name__)
 
 DATABASE = 'trades.db'
 
 def get_db():
-    conn = sqlite3.connect(DATABASE)
+    conn = sqlite3.connect(DATABASE, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -100,6 +102,7 @@ target_channel = config['target_channel']
 openai_api_key = config['openai_api_key']
 metaapi_token = config['metaapi_token']
 metaapi_account_id = config['metaapi_account_id']
+market_value = config['market_value']
 
 # Initialize the Telegram client
 client = TelegramClient('session_name', api_id, api_hash)
@@ -173,13 +176,13 @@ async def place_orders(account, trade):
                 except Exception as e:
                     print(f"Order placement failed on retry: {e}")
 
-        save_trade(trade)
-        update_status(trade.trade_id)
+        await save_trade(trade)
+        await update_status(trade.trade_id)
         return True
     except Exception as e:
         print(f"Error placing trade: {e}")
         return False
-    
+
 async def check_orders_and_positions(account):
     while True:
         try:
@@ -201,12 +204,23 @@ async def check_orders_and_positions(account):
                 for entry in entries:
                     order_id = entry['order_id']
                     if order_id:
-                        order_status = await connection.get_order(order_id)
-                        if order_status:
-                            entry_status = 'filled' if order_status['filledVolume'] > 0 else 'open'
-                            cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry_status, entry['id']))
-                        else:
-                            cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                        try:
+                            print(f"Checking order {order_id}")
+                            order_status = await connection.get_order(order_id)
+                            print(f"Order status for {order_id}: {order_status}")
+                            if order_status:
+                                entry_status = 'filled' if 'filledVolume' in order_status and order_status['filledVolume'] > 0 else 'open'
+                                cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry_status, entry['id']))
+                                print(f"Updated entry status for {order_id} to {entry_status}")
+                            else:
+                                cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                                print(f"Order {order_id} is closed")
+                        except Exception as e:
+                            if "Order with specified id not found" in str(e):
+                                cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                                print(f"Order {order_id} not found, marking as closed")
+                            else:
+                                print(f"Error checking order {order_id}: {e}")
 
                 conn.commit()
             conn.close()
@@ -229,30 +243,37 @@ def default(obj):
     else:
         raise TypeError(f"Type {obj} not serializable")
 
-def save_trade(trade):
+async def execute_with_retry(sql, params):
     conn = get_db()
     cursor = conn.cursor()
+    retries = 5
+    for attempt in range(retries):
+        try:
+            cursor.execute(sql, params)
+            conn.commit()
+            return
+        except OperationalError as e:
+            if 'database is locked' in str(e) and attempt < retries - 1:
+                print(f"Database is locked, retrying... ({attempt + 1}/{retries})")
+                await sleep(0.5)
+            else:
+                raise
+    conn.close()
 
-    cursor.execute('''INSERT OR REPLACE INTO trades (trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, status)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                   (trade.trade_id, trade.action, trade.symbol, trade.entry_price_low, trade.entry_price_high, trade.sl, trade.tp1, trade.tp2, trade.status))
+async def save_trade(trade):
+    await execute_with_retry('''INSERT OR REPLACE INTO trades (trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, status)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                       (trade.trade_id, trade.action, trade.symbol, trade.entry_price_low, trade.entry_price_high, trade.sl, trade.tp1, trade.tp2, trade.status))
 
-    cursor.execute('DELETE FROM entries WHERE trade_id = ?', (trade.trade_id,))
+    await execute_with_retry('DELETE FROM entries WHERE trade_id = ?', (trade.trade_id,))
     for entry in trade.entries:
-        cursor.execute('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                       (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+        await execute_with_retry('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                           (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
 
-    conn.commit()
-    conn.close()
-
-def update_status(trade_id):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM status')
-    cursor.execute('INSERT INTO status (latest_trade_id) VALUES (?)', (trade_id,))
-    conn.commit()
-    conn.close()
+async def update_status(trade_id):
+    await execute_with_retry('DELETE FROM status', ())
+    await execute_with_retry('INSERT INTO status (latest_trade_id) VALUES (?)', (trade_id,))
 
 def get_latest_trade_id():
     conn = get_db()
@@ -276,7 +297,7 @@ async def interpret_message(text):
         return details
     except openai.error.RateLimitError:
         print("Rate limit exceeded. Waiting before retrying...")
-        await asyncio.sleep(60)  # Wait for 1 minute before retrying
+        await asyncio.sleep(60)
         return await interpret_message(text)
     except Exception as e:
         print(f"Error interpreting message: {e}")
@@ -285,7 +306,7 @@ async def interpret_message(text):
 def parse_trade_message(details, trade_id):
     try:
         action = details['action']
-        symbol = "XAUUSD+"  # Always use XAUUSD+
+        symbol = "XAUUSD+"
         entry_price_low = details['entry_price_low']
         entry_price_high = details['entry_price_high']
         sl = details['sl']
@@ -296,12 +317,12 @@ def parse_trade_message(details, trade_id):
 
         trade = Trade(trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2)
 
-        step = (entry_price_high - entry_price_low) / 11  # Step between entries to evenly distribute within the zone
+        step = (entry_price_high - entry_price_low) / 11
 
         if action.lower() == "buy":
-            volumes = [0.03] * 4 + [0.02] * 4 + [0.01] * 4  # Buy: Top -> 0.01, Middle -> 0.02, Bottom -> 0.03
+            volumes = [0.03] * 4 + [0.02] * 4 + [0.01] * 4
         else:
-            volumes = [0.01] * 4 + [0.02] * 4 + [0.03] * 4  # Sell: Top -> 0.03, Middle -> 0.02, Bottom -> 0.01
+            volumes = [0.01] * 4 + [0.02] * 4 + [0.03] * 4
 
         for i in range(12):
             price = entry_price_low + i * step
@@ -331,12 +352,12 @@ async def handler(event):
     details = await interpret_message(text)
 
     if details:
-        trade_id = message.id  # Use the message ID as the trade ID
+        trade_id = message.id
         trade = parse_trade_message(details, trade_id)
         if trade:
             account = await connect_metaapi()
             if account:
-                save_trade(trade)
+                await save_trade(trade)
                 await place_orders(account, trade)
                 await place_additional_market_order(account, trade)
                 print("Trade placed successfully in MetaAPI")
@@ -356,22 +377,26 @@ async def place_additional_market_order(account, trade):
 
     volume = 0.04
 
-    if trade.action.lower() == "buy":
-        sl = current_price - 6
-        tp = current_price + 4
-        print(f"Placing additional market buy order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp}")
-        result = await connection.create_market_buy_order(trade.symbol, volume, stop_loss=sl, take_profit=tp)
-    else:
-        sl = current_price + 6
-        tp = current_price - 4
-        print(f"Placing additional market sell order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp}")
-        result = await connection.create_market_sell_order(trade.symbol, volume, stop_loss=sl, take_profit=tp)
+    try:
+        if trade.action.lower() == "buy":
+            sl = current_price - 6
+            tp = current_price + 4
+            print(f"Placing additional market buy order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp}")
+            result = await connection.create_market_buy_order(trade.symbol, volume, stop_loss=sl, take_profit=tp)
+        else:
+            sl = current_price + 6
+            tp = current_price - 4
+            print(f"Placing additional market sell order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp}")
+            result = await connection.create_market_sell_order(trade.symbol, volume, stop_loss=sl, take_profit=tp)
 
-    if 'orderId' in result:
-        order_id = result['orderId']
-        trade.add_entry(current_price, tp, sl, volume, order_type='market')
-        save_trade(trade)
-        print(f"Placed additional market order: {result}")
+        if 'orderId' in result:
+            order_id = result['orderId']
+            trade.add_entry(current_price, tp, sl, volume, order_type='market')
+            await save_trade(trade)
+            print(f"Placed additional market order: {result}")
+    except metaapi_cloud_sdk.clients.error_handler.ValidationException as e:
+        print(f"Error placing additional market order: {e}")
+        
 
 async def close_all_orders(account, trade_id):
     try:
@@ -412,7 +437,7 @@ async def close_all_orders(account, trade_id):
                 entry['status'] = 'closed'
 
         trade.status = 'closed'
-        save_trade(trade)
+        await save_trade(trade)
         
         print(f"All orders for trade_id {trade_id} closed successfully")
     except Exception as e:
@@ -465,11 +490,11 @@ async def fetch_open_orders(account):
                 symbol = order['symbol']
                 order_id = order['id']
                 volume = order['volume']
-                entry_price = order.get('price', 'N/A')  # Use .get to handle missing 'price'
+                entry_price = order.get('price', 'N/A')
                 sl = order.get('stopLoss', 'N/A')
                 tp = order.get('takeProfit', 'N/A')
                 comment = "Gold Trader Ben"
-                current_pl = 'N/A'  # Unfilled orders don't have P&L
+                current_pl = 'N/A'
                 open_orders.append({
                     'order_id': order_id,
                     'symbol': symbol,
@@ -503,7 +528,7 @@ async def update_trade_status(account, trade_id):
         if entry['status'] == 'open':
             order = await connection.get_order(entry['order_id'])
             if order:
-                if order['state'] == 'filled':
+                if 'filledVolume' in order and order['filledVolume'] > 0:
                     entry['status'] = 'filled'
                 elif order['state'] == 'cancelled':
                     entry['status'] = 'closed'
@@ -592,9 +617,17 @@ async def close_specific_position(position_id):
         print(f"Error closing position: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func is None:
+        raise RuntimeError('Not running with the Werkzeug Server')
+    func()
+    return 'Server shutting down...'
+
 async def main():
     print("Starting Telegram client...")
-    await client.start(phone_number)  # Start the client and authenticate if needed
+    await client.start(phone_number)
     print(f'Listening to new messages in {target_channel}...')
 
     await client.run_until_disconnected()
@@ -607,9 +640,12 @@ def run():
     account = loop.run_until_complete(connect_metaapi())
     if account:
         checker_task = ensure_future(check_orders_and_positions(account))
-
-    loop.run_until_complete(asyncio.gather(app_task, telegram_task))
+        loop.run_until_complete(asyncio.gather(app_task, telegram_task, checker_task))
+    else:
+        loop.run_until_complete(asyncio.gather(app_task, telegram_task))
 
 if __name__ == "__main__":
+    if os.path.exists(DATABASE):
+        os.remove(DATABASE)
     init_db()
     run()
