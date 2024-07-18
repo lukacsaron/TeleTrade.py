@@ -202,6 +202,80 @@ async def place_orders(account, trade):
         print(f"Error placing trade: {e}")
         return False
 
+async def place_additional_market_order(account, trade):
+    connection = account.get_rpc_connection()
+    await connection.connect()
+    await connection.wait_synchronized()
+
+    current_price = await get_current_price(account, trade.symbol)
+
+    if current_price is None:
+        print("Error fetching current price, cannot place market order")
+        return
+
+    volume = 0.02
+
+    try:
+        # Place first market order with TP1
+        if trade.action.lower() == "buy":
+            sl = current_price - 6
+            tp1 = trade.tp1
+            print(f"Placing first market buy order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp1}")
+            result1 = await connection.create_market_buy_order(trade.symbol, volume, stop_loss=sl, take_profit=tp1)
+        else:
+            sl = current_price + 6
+            tp1 = trade.tp1
+            print(f"Placing first market sell order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp1}")
+            result1 = await connection.create_market_sell_order(trade.symbol, volume, stop_loss=sl, take_profit=tp1)
+
+        if 'orderId' not in result1:
+            print("Failed to place first market order.")
+            return
+
+        trade.market1_id = result1['orderId']
+
+        # Place second market order with TP2
+        if trade.action.lower() == "buy":
+            tp2 = trade.tp2
+            print(f"Placing second market buy order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp2}")
+            result2 = await connection.create_market_buy_order(trade.symbol, volume, stop_loss=sl, take_profit=tp2)
+        else:
+            tp2 = trade.tp2
+            print(f"Placing second market sell order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp2}")
+            result2 = await connection.create_market_sell_order(trade.symbol, volume, stop_loss=sl, take_profit=tp2)
+
+        if 'orderId' not in result2:
+            print("Failed to place second market order.")
+            await connection.cancel_order(trade.market1_id)  # Cancel the first market order
+            trade.market1_id = None
+            return
+
+        trade.market2_id = result2['orderId']
+        await save_trade(trade)
+        print(f"Placed additional market orders: {result1}, {result2}")
+    except metaapi_cloud_sdk.clients.metaapi.trade_exception.TradeException as e:
+        print(f"Error placing additional market order: {e}")
+        if "Market is closed" in str(e):
+            await cancel_all_orders(account, trade)
+        else:
+            raise
+
+async def cancel_all_orders(account, trade):
+    connection = account.get_rpc_connection()
+    await connection.connect()
+    await connection.wait_synchronized()
+    for entry in trade.entries:
+        if entry['order_id']:
+            await connection.cancel_order(entry['order_id'])
+            entry['status'] = 'closed'
+    if trade.market1_id:
+        await connection.cancel_order(trade.market1_id)
+    if trade.market2_id:
+        await connection.cancel_order(trade.market2_id)
+    trade.status = 'closed'
+    await save_trade(trade)
+    print(f"Cancelled all orders for trade {trade.trade_id}")
+
 async def check_orders_and_positions(account):
     while True:
         try:
@@ -225,7 +299,7 @@ async def check_orders_and_positions(account):
                 tp1_reached = False
 
                 for entry in entries:
-                    if entry['status'] == 'closed' or entry['status'] == 'filled':
+                    if entry['status'] in ['closed', 'filled']:
                         continue
 
                     order_id = entry['order_id']
@@ -277,6 +351,7 @@ async def check_orders_and_positions(account):
 
                 # Check if any position with TP1 is closed
                 positions = await connection.get_positions()
+                tp1_reached = False
                 for pos in positions:
                     for entry in entries:
                         if entry['tp'] == trade_row['tp1'] and entry['status'] == 'filled' and pos['id'] == entry['order_id']:
@@ -346,9 +421,9 @@ async def execute_with_retry(sql, params):
                 raise
 
 async def save_trade(trade):
-    await execute_with_retry('''INSERT OR REPLACE INTO trades (trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, status)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                       (trade.trade_id, trade.action, trade.symbol, trade.entry_price_low, trade.entry_price_high, trade.sl, trade.tp1, trade.tp2, trade.status))
+    await execute_with_retry('''INSERT OR REPLACE INTO trades (trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, status, market1_id, market2_id)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                       (trade.trade_id, trade.action, trade.symbol, trade.entry_price_low, trade.entry_price_high, trade.sl, trade.tp1, trade.tp2, trade.status, trade.market1_id, trade.market2_id))
 
     await execute_with_retry('DELETE FROM entries WHERE trade_id = ?', (trade.trade_id,))
     for entry in trade.entries:
@@ -390,7 +465,7 @@ async def interpret_message(text):
 def parse_trade_message(details, trade_id):
     try:
         action = details['action']
-        symbol = "XAUUSD+"
+        symbol = "BTCUSD"
         entry_price_low = details['entry_price_low']
         entry_price_high = details['entry_price_high']
         sl = details['sl']
@@ -442,45 +517,11 @@ async def handler(event):
             account = await connect_metaapi()
             if account:
                 await save_trade(trade)
-                await place_orders(account, trade)
                 await place_additional_market_order(account, trade)
+                await place_orders(account, trade)
                 print("Trade placed successfully in MetaAPI")
 
     print(f"New message processed: {message.id}")
-
-async def place_additional_market_order(account, trade):
-    connection = account.get_rpc_connection()
-    await connection.connect()
-    await connection.wait_synchronized()
-
-    current_price = await get_current_price(account, trade.symbol)
-
-    if current_price is None:
-        print("Error fetching current price, cannot place market order")
-        return
-
-    volume = 0.04
-
-    try:
-        if trade.action.lower() == "buy":
-            sl = current_price - 6
-            tp = current_price + 4
-            print(f"Placing additional market buy order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp}")
-            result = await connection.create_market_buy_order(trade.symbol, volume, stop_loss=sl, take_profit=tp)
-        else:
-            sl = current_price + 6
-            tp = current_price - 4
-            print(f"Placing additional market sell order: symbol={trade.symbol}, volume={volume}, sl={sl}, tp={tp}")
-            result = await connection.create_market_sell_order(trade.symbol, volume, stop_loss=sl, take_profit=tp)
-
-        if 'orderId' in result:
-            order_id = result['orderId']
-            trade.add_entry(current_price, tp, sl, volume, order_type='market')
-            trade.entries[-1]['order_id'] = order_id
-            await save_trade(trade)
-            print(f"Placed additional market order: {result}")
-    except metaapi_cloud_sdk.clients.error_handler.ValidationException as e:
-        print(f"Error placing additional market order: {e}")
 
 async def close_all_orders(account, trade_id):
     try:
