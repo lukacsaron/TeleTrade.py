@@ -8,6 +8,7 @@ from telethon import TelegramClient, events
 from datetime import datetime
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 from metaapi_cloud_sdk import MetaApi
+from metaapi_cloud_sdk.clients.metaapi.trade_exception import TradeException
 from flask import Flask, render_template, request, jsonify
 from asyncio import ensure_future, sleep
 import os
@@ -152,6 +153,10 @@ async def get_current_price(account, symbol):
         print(f"Error fetching current price: {e}")
         return None
 
+async def validate_order_parameters(sl, tp1, tp2):
+    if sl <= tp1 or sl <= tp2:
+        raise ValueError("Invalid stop loss or take profit values.")
+
 async def place_orders(account, trade):
     if not account:
         raise Exception("Account not connected")
@@ -160,40 +165,39 @@ async def place_orders(account, trade):
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized()
-        
+
+        await validate_order_parameters(trade.sl, trade.tp1, trade.tp2)
+
         for entry in trade.entries:
             entry_price = entry['entry']
             tp = entry['tp']
             sl = entry['sl']
             volume = entry['volume']
             order_type = entry['order_type']
-            
-            def switch_order_type(order_type):
-                return "stop" if order_type == "limit" else "limit"
 
-            def print_order_info(order_type, result):
-                print(f"Placing {trade.action.capitalize()} {order_type} order: symbol={trade.symbol}, volume={volume}, entry_price={entry_price}, sl={sl}, tp={tp}")
-                if 'orderId' in result:
-                    order_id = result['orderId']
-                    entry['order_id'] = order_id
-                    print(f"Order placed successfully: {result['stringCode']} with order_id: {order_id}")
-                else:
-                    print(f"Order placement failed: {result}")
-
-            try:
-                if trade.action.lower() == "buy":
-                    print_order_info(order_type, await (connection.create_limit_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp) if order_type == "limit" else connection.create_stop_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp)))
-                else:
-                    print_order_info(order_type, await (connection.create_limit_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp) if order_type == "limit" else connection.create_stop_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp)))
-            except Exception as e:
-                print(f"{order_type.capitalize()} order failed, retrying with {switch_order_type(order_type)} order: {e}")
+            async def place_order(order_func):
                 try:
-                    if trade.action.lower() == "buy":
-                        print_order_info(switch_order_type(order_type), await (connection.create_stop_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp) if order_type == "limit" else connection.create_limit_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp)))
+                    result = await order_func()
+                    if 'orderId' in result:
+                        entry['order_id'] = result['orderId']
+                        print(f"Order placed successfully: {result['stringCode']} with order_id: {entry['order_id']}")
+                        cursor.execute('UPDATE entries SET order_id = ? WHERE id = ?', (entry['order_id'], entry['id']))
+                        conn.commit()
                     else:
-                        print_order_info(switch_order_type(order_type), await (connection.create_stop_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp) if order_type == "limit" else connection.create_limit_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp)))
+                        print(f"Order placement failed: {result}")
                 except Exception as e:
-                    print(f"Order placement failed on retry: {e}")
+                    print(f"Error placing order: {e}")
+
+            if trade.action.lower() == "buy":
+                if order_type == "limit":
+                    await place_order(lambda: connection.create_limit_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
+                else:
+                    await place_order(lambda: connection.create_stop_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
+            else:
+                if order_type == "limit":
+                    await place_order(lambda: connection.create_limit_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
+                else:
+                    await place_order(lambda: connection.create_stop_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
 
         await save_trade(trade)
         await update_status(trade.trade_id)
@@ -216,6 +220,8 @@ async def place_additional_market_order(account, trade):
     volume = 0.02
 
     try:
+        await validate_order_parameters(trade.sl, trade.tp1, trade.tp2)
+        
         # Place first market order with TP1
         if trade.action.lower() == "buy":
             sl = current_price - 6
@@ -253,7 +259,7 @@ async def place_additional_market_order(account, trade):
         trade.market2_id = result2['orderId']
         await save_trade(trade)
         print(f"Placed additional market orders: {result1}, {result2}")
-    except metaapi_cloud_sdk.clients.metaapi.trade_exception.TradeException as e:
+    except TradeException as e:
         print(f"Error placing additional market order: {e}")
         if "Market is closed" in str(e):
             await cancel_all_orders(account, trade)
@@ -455,7 +461,7 @@ async def interpret_message(text):
         print(f"OpenAI parsed response: {details}")
         return details
     except openai.error.RateLimitError:
-        print("Rate limit exceeded. Waitinx0g before retrying...")
+        print("Rate limit exceeded. Waiting before retrying...")
         await asyncio.sleep(60)
         return await interpret_message(text)
     except Exception as e:
