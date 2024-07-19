@@ -207,6 +207,7 @@ async def place_orders(account, trade):
                         if 'Invalid price in the request' in str(e) and alt_order_func:
                             print(f"Trying alternate order type for attempt {attempt + 1}/{retries}")
                             order_func = alt_order_func
+                            order_type = "stop" if order_type == "limit" else "limit"
                         await asyncio.sleep(2 ** attempt)  # Exponential backoff
                 print(f"Failed to place order after {retries} attempts.")
 
