@@ -209,6 +209,9 @@ async def place_orders(account, trade):
                             order_func = alt_order_func
                             order_type = "stop" if order_type == "limit" else "limit"
                         await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                # Mark order as failed if all attempts fail
+                cursor.execute('UPDATE entries SET status = ?, order_type = ? WHERE id = ?', ('failed', order_type, entry['id']))
+                conn.commit()
                 print(f"Failed to place order after {retries} attempts.")
 
             if trade.action.lower() == "buy":
@@ -249,6 +252,15 @@ async def place_additional_market_order(account, trade):
         print("Error fetching current price, cannot place market order")
         return
 
+    # Validate that the trade is still viable based on current price and TP values
+    if (trade.action.lower() == "buy" and (trade.tp1 <= current_price or trade.tp2 <= current_price)) or \
+       (trade.action.lower() == "sell" and (trade.tp1 >= current_price or trade.tp2 >= current_price)):
+        print("Trade is currently invalid due to price movement. Not placing additional orders.")
+        cursor = conn.cursor()
+        cursor.execute('UPDATE entries SET status = ? WHERE trade_id = ? AND order_id IS NULL', ('failed', trade.trade_id))
+        conn.commit()
+        return
+
     volume = 0.02
     conn = get_db()
     cursor = conn.cursor()
@@ -274,6 +286,8 @@ async def place_additional_market_order(account, trade):
 
         if 'orderId' not in result1:
             print("Failed to place first market order.")
+            cursor.execute('UPDATE entries SET status = ? WHERE order_id IS NULL AND trade_id = ?', ('failed', trade.trade_id))
+            conn.commit()
             order_checking_paused = False
             return
 
@@ -305,7 +319,7 @@ async def place_additional_market_order(account, trade):
             print("Failed to place second market order.")
             await connection.cancel_order(trade.market1_id)  # Cancel the first market order
             trade.market1_id = None
-            cursor.execute('UPDATE entries SET order_id = NULL, order_type = ? WHERE trade_id = ? AND order_id = ?', ('market', trade.trade_id, result1['orderId']))
+            cursor.execute('UPDATE entries SET status = ? WHERE order_id = ?', ('failed', result1['orderId']))
             conn.commit()
             order_checking_paused = False
             return
@@ -367,7 +381,6 @@ async def check_orders_and_positions(account):
 
             for trade_row in recent_trades:
                 trade_id = trade_row['trade_id']
-                entry_price_low = trade_row['entry_price_low']
                 cursor.execute('SELECT * FROM entries WHERE trade_id = ?', (trade_id,))
                 entries = cursor.fetchall()
 
@@ -426,16 +439,15 @@ async def check_orders_and_positions(account):
                                 print(f"Error checking order {order_id}: {e}")
                                 all_closed = False
                     else:
-                        cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
-                        print(f"Market order without order_id, marking as closed")
+                        cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('failed', entry['id']))
+                        print(f"Market order without order_id, marking as failed")
 
                 # Check if any position with TP1 is closed
                 positions = await connection.get_positions()
-                tp1_reached = False
                 for pos in positions:
                     for entry in entries:
-                        if entry['tp'] == trade_row['tp1'] and entry['status'] == 'filled' and pos['id'] == entry['order_id']:
-                            if pos['unrealizedProfit'] >= (trade_row['tp1'] - entry_price_low) * pos['volume']:
+                        if entry['tp'] == trade_row['tp1'] and entry['volume'] == 0.02 and entry['order_type'] == 'market':
+                            if entry['status'] == 'closed':
                                 tp1_reached = True
                                 break
                     if tp1_reached:
@@ -469,7 +481,6 @@ async def check_orders_and_positions(account):
             print(f"Error checking orders and positions: {e}")
 
         await sleep(2.5)
-
 
 def default(obj):
     if isinstance(obj, datetime):
