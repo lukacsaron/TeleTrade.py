@@ -186,7 +186,7 @@ async def place_orders(account, trade):
                 entry_price = current_price + 0.02 if trade.action.lower() == "buy" else current_price - 0.02
                 print(f"Adjusted entry price to {entry_price} to avoid being too close to the current market price.")
 
-            async def place_order(order_func, entry, alt_order_func=None):
+            async def place_order(order_func, entry, order_type, alt_order_func=None):
                 retries = 3
                 for attempt in range(retries):
                     try:
@@ -197,7 +197,7 @@ async def place_orders(account, trade):
                             entry['id'] = entry.get('id', 0)  # Ensure 'id' key is present
                             print(f"Order placed successfully: {result['stringCode']} with order_id: {entry['order_id']}")
                             cursor.execute('UPDATE entries SET order_id = ?, order_type = ? WHERE id = ?', 
-                                           (entry['order_id'], entry['order_type'], entry['id']))
+                                           (entry['order_id'], order_type, entry['id']))
                             conn.commit()
                             return
                         else:
@@ -213,20 +213,20 @@ async def place_orders(account, trade):
             if trade.action.lower() == "buy":
                 if order_type == "limit":
                     await place_order(lambda: connection.create_limit_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
-                                      entry,
+                                      entry, "limit",
                                       lambda: connection.create_stop_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
                 else:
                     await place_order(lambda: connection.create_stop_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
-                                      entry,
+                                      entry, "stop",
                                       lambda: connection.create_limit_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
             else:
                 if order_type == "limit":
                     await place_order(lambda: connection.create_limit_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
-                                      entry,
+                                      entry, "limit",
                                       lambda: connection.create_stop_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
                 else:
                     await place_order(lambda: connection.create_stop_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
-                                      entry,
+                                      entry, "stop",
                                       lambda: connection.create_limit_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
 
         await save_trade(trade)
@@ -278,13 +278,16 @@ async def place_additional_market_order(account, trade):
 
         trade.market1_id = result1['orderId']
 
-        cursor.execute('SELECT id FROM entries WHERE trade_id = ? AND order_type = ? AND order_id IS NULL LIMIT 1', 
-                       (trade.trade_id, 'market'))
+        cursor.execute('SELECT id FROM entries WHERE trade_id = ? AND order_id IS NULL LIMIT 1', 
+                       (trade.trade_id,))
         entry_to_update = cursor.fetchone()
 
         if entry_to_update:
             cursor.execute('UPDATE entries SET order_id = ?, order_type = ? WHERE id = ?', 
                            (result1['orderId'], 'market', entry_to_update['id']))
+        else:
+            cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
+                           (trade.trade_id, current_price, tp1, sl, volume, 'market', result1['orderId'], 'open'))
         conn.commit()
 
         # Place second market order with TP2
@@ -307,13 +310,16 @@ async def place_additional_market_order(account, trade):
             return
 
         trade.market2_id = result2['orderId']
-        cursor.execute('SELECT id FROM entries WHERE trade_id = ? AND order_type = ? AND order_id IS NULL LIMIT 1', 
-                       (trade.trade_id, 'market'))
+        cursor.execute('SELECT id FROM entries WHERE trade_id = ? AND order_id IS NULL LIMIT 1', 
+                       (trade.trade_id,))
         entry_to_update = cursor.fetchone()
 
         if entry_to_update:
             cursor.execute('UPDATE entries SET order_id = ?, order_type = ? WHERE id = ?', 
                            (result2['orderId'], 'market', entry_to_update['id']))
+        else:
+            cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
+                           (trade.trade_id, current_price, tp2, sl, volume, 'market', result2['orderId'], 'open'))
         conn.commit()
         await save_trade(trade)
         print(f"Placed additional market orders: {result1}, {result2}")
