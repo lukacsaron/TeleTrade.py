@@ -131,6 +131,9 @@ client = TelegramClient('session_name', api_id, api_hash)
 # Initialize OpenAI API client
 openai.api_key = openai_api_key
 
+# Define the global variable
+order_checking_paused = False
+
 async def connect_metaapi():
     try:
         print("Connecting to MetaApi...")
@@ -163,7 +166,6 @@ async def validate_order_parameters(action, sl, tp1, tp2):
             raise ValueError("Invalid stop loss or take profit values for a sell order.")
     else:
         raise ValueError("Invalid action. Must be 'buy' or 'sell'.")
-
 
 async def place_orders(account, trade):
     if not account:
@@ -336,6 +338,10 @@ async def place_additional_market_order(account, trade):
         log_db_action(f"Inserted second market order into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp2}, {sl}, {volume}, market, {result2['orderId']}, open)")
         conn.commit()
 
+        # Ensure market orders are saved correctly
+        trade.entries.append({'entry': current_price, 'tp': tp1, 'sl': sl, 'volume': volume, 'order_type': 'market', 'order_id': result1['orderId'], 'status': 'open'})
+        trade.entries.append({'entry': current_price, 'tp': tp2, 'sl': sl, 'volume': volume, 'order_type': 'market', 'order_id': result2['orderId'], 'status': 'open'})
+
         await save_trade(trade)
         print(f"Placed additional market orders: {result1}, {result2}")
     except TradeException as e:
@@ -349,25 +355,8 @@ async def place_additional_market_order(account, trade):
         order_checking_paused = False
 
 
-async def cancel_all_orders(account, trade):
-    connection = account.get_rpc_connection()
-    await connection.connect()
-    await connection.wait_synchronized()
-    for entry in trade.entries:
-        if entry['order_id']:
-            await connection.cancel_order(entry['order_id'])
-            entry['status'] = 'closed'
-    if trade.market1_id:
-        await connection.cancel_order(trade.market1_id)
-    if trade.market2_id:
-        await connection.cancel_order(trade.market2_id)
-    trade.status = 'closed'
-    await save_trade(trade)
-    print(f"Cancelled all orders for trade {trade.trade_id}")
-
-order_checking_paused = False
-
 async def check_orders_and_positions(account):
+    global order_checking_paused
     while True:
         if order_checking_paused:
             await sleep(2.5)
@@ -530,15 +519,24 @@ async def execute_with_retry(sql, params):
                 raise
 
 async def save_trade(trade):
+    conn = get_db()
+    cursor = conn.cursor()
+    
     await execute_with_retry('''INSERT OR REPLACE INTO trades (trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, status, market1_id, market2_id)
                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                        (trade.trade_id, trade.action, trade.symbol, trade.entry_price_low, trade.entry_price_high, trade.sl, trade.tp1, trade.tp2, trade.status, trade.market1_id, trade.market2_id))
 
-    await execute_with_retry('DELETE FROM entries WHERE trade_id = ?', (trade.trade_id,))
     for entry in trade.entries:
-        await execute_with_retry('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
+        if entry['order_type'] == 'market':
+            cursor.execute('''INSERT OR IGNORE INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                            (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+        else:
+            await execute_with_retry('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                           (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+    
+    conn.commit()
 
 async def update_status(trade_id):
     await execute_with_retry('DELETE FROM status', ())
