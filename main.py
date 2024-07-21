@@ -199,6 +199,7 @@ async def place_orders(account, trade):
                             cursor.execute('UPDATE entries SET order_id = ?, order_type = ? WHERE id = ?', 
                                            (entry['order_id'], order_type, entry['id']))
                             conn.commit()
+                            log_db_action(f"Updated entries SET order_id = {entry['order_id']}, order_type = {order_type} WHERE id = {entry['id']}")
                             return
                         else:
                             print(f"Order placement failed: {result}")
@@ -212,7 +213,7 @@ async def place_orders(account, trade):
                 # Mark order as failed if all attempts fail
                 cursor.execute('UPDATE entries SET status = ?, order_type = ? WHERE id = ?', ('failed', order_type, entry['id']))
                 conn.commit()
-                print(f"Failed to place order after {retries} attempts.")
+                log_db_action(f"Failed to place order after {retries} attempts. Updated entries SET status = failed, order_type = {order_type} WHERE id = {entry['id']}")
 
             if trade.action.lower() == "buy":
                 if order_type == "limit":
@@ -259,6 +260,7 @@ async def place_additional_market_order(account, trade):
         cursor = conn.cursor()
         cursor.execute('UPDATE entries SET status = ? WHERE trade_id = ? AND order_id IS NULL', ('failed', trade.trade_id))
         conn.commit()
+        log_db_action(f"Trade is currently invalid due to price movement. Updated entries SET status = failed WHERE trade_id = {trade.trade_id} AND order_id IS NULL")
         return
 
     volume = 0.02
@@ -288,6 +290,7 @@ async def place_additional_market_order(account, trade):
             print("Failed to place first market order.")
             cursor.execute('UPDATE entries SET status = ? WHERE order_id IS NULL AND trade_id = ?', ('failed', trade.trade_id))
             conn.commit()
+            log_db_action(f"Failed to place first market order. Updated entries SET status = failed WHERE order_id IS NULL AND trade_id = {trade.trade_id}")
             order_checking_paused = False
             return
 
@@ -300,9 +303,11 @@ async def place_additional_market_order(account, trade):
         if entry_to_update:
             cursor.execute('UPDATE entries SET order_id = ?, order_type = ? WHERE id = ?', 
                            (result1['orderId'], 'market', entry_to_update['id']))
+            log_db_action(f"Updated entries SET order_id = {result1['orderId']}, order_type = market WHERE id = {entry_to_update['id']}")
         else:
             cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
                            (trade.trade_id, current_price, tp1, sl, volume, 'market', result1['orderId'], 'open'))
+            log_db_action(f"Inserted into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp1}, {sl}, {volume}, market, {result1['orderId']}, open)")
         conn.commit()
 
         # Place second market order with TP2
@@ -321,6 +326,7 @@ async def place_additional_market_order(account, trade):
             trade.market1_id = None
             cursor.execute('UPDATE entries SET status = ? WHERE order_id = ?', ('failed', result1['orderId']))
             conn.commit()
+            log_db_action(f"Failed to place second market order. Canceled first market order and updated entries SET status = failed WHERE order_id = {result1['orderId']}")
             order_checking_paused = False
             return
 
@@ -332,9 +338,11 @@ async def place_additional_market_order(account, trade):
         if entry_to_update:
             cursor.execute('UPDATE entries SET order_id = ?, order_type = ? WHERE id = ?', 
                            (result2['orderId'], 'market', entry_to_update['id']))
+            log_db_action(f"Updated entries SET order_id = {result2['orderId']}, order_type = market WHERE id = {entry_to_update['id']}")
         else:
             cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
                            (trade.trade_id, current_price, tp2, sl, volume, 'market', result2['orderId'], 'open'))
+            log_db_action(f"Inserted into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp2}, {sl}, {volume}, market, {result2['orderId']}, open)")
         conn.commit()
         await save_trade(trade)
         print(f"Placed additional market orders: {result1}, {result2}")
@@ -403,6 +411,7 @@ async def check_orders_and_positions(account):
                             if order_status:
                                 entry_status = 'filled' if 'filledVolume' in order_status and order_status['filledVolume'] > 0 else 'open'
                                 cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry_status, entry['id']))
+                                log_db_action(f"Updated entries SET status = {entry_status} WHERE id = {entry['id']}")
                                 print(f"Updated entry status for {order_id} to {entry_status}")
                                 if entry_status == 'open':
                                     all_closed = False
@@ -414,11 +423,13 @@ async def check_orders_and_positions(account):
                                     if pos['id'] == order_id:
                                         entry_status = 'filled'
                                         cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry_status, entry['id']))
+                                        log_db_action(f"Order {order_id} is filled and now a position. Updated entries SET status = {entry_status} WHERE id = {entry['id']}")
                                         print(f"Order {order_id} is filled and now a position")
                                         found_position = True
                                         break
                                 if not found_position:
                                     cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                                    log_db_action(f"Order {order_id} is closed. Updated entries SET status = closed WHERE id = {entry['id']}")
                                     print(f"Order {order_id} is closed")
                         except Exception as e:
                             if "Order with specified id not found" in str(e):
@@ -429,17 +440,20 @@ async def check_orders_and_positions(account):
                                     if pos['id'] == order_id:
                                         entry_status = 'filled'
                                         cursor.execute('UPDATE entries SET status = ? WHERE id = ?', (entry_status, entry['id']))
+                                        log_db_action(f"Order {order_id} is filled and now a position. Updated entries SET status = {entry_status} WHERE id = {entry['id']}")
                                         print(f"Order {order_id} is filled and now a position")
                                         found_position = True
                                         break
                                 if not found_position:
                                     cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                                    log_db_action(f"Order {order_id} is closed. Updated entries SET status = closed WHERE id = {entry['id']}")
                                     print(f"Order {order_id} is closed")
                             else:
                                 print(f"Error checking order {order_id}: {e}")
                                 all_closed = False
                     else:
                         cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('failed', entry['id']))
+                        log_db_action(f"Market order without order_id, marking as failed. Updated entries SET status = failed WHERE id = {entry['id']}")
                         print(f"Market order without order_id, marking as failed")
 
                 # Check if any position with TP1 is closed
@@ -465,15 +479,18 @@ async def check_orders_and_positions(account):
                         if entry['status'] == 'open':
                             await connection.cancel_order(entry['order_id'])
                             cursor.execute('UPDATE entries SET status = ? WHERE id = ?', ('closed', entry['id']))
+                            log_db_action(f"Canceled open order {entry['order_id']} for trade {trade_id}. Updated entries SET status = closed WHERE id = {entry['id']}")
                             print(f"Canceled open order {entry['order_id']} for trade {trade_id}")
 
                 if all_closed:
                     all_filled = all(entry['status'] == 'filled' for entry in entries)
                     if all_filled:
                         cursor.execute('UPDATE trades SET status = ? WHERE trade_id = ?', ('filled', trade_id))
+                        log_db_action(f"All orders for trade {trade_id} are filled. Updated trades SET status = filled WHERE trade_id = {trade_id}")
                         print(f"All orders for trade {trade_id} are filled, marking trade as filled")
                     else:
                         cursor.execute('UPDATE trades SET status = ? WHERE trade_id = ?', ('closed', trade_id))
+                        log_db_action(f"All orders for trade {trade_id} are closed. Updated trades SET status = closed WHERE trade_id = {trade_id}")
                         print(f"All orders for trade {trade_id} are closed, marking trade as closed")
 
                 conn.commit()
@@ -481,6 +498,10 @@ async def check_orders_and_positions(account):
             print(f"Error checking orders and positions: {e}")
 
         await sleep(2.5)
+
+def log_db_action(action):
+    with open("db_log.txt", "a") as log_file:
+        log_file.write(f"{datetime.now()}: {action}\n")
 
 def default(obj):
     if isinstance(obj, datetime):
@@ -504,12 +525,15 @@ async def execute_with_retry(sql, params):
         try:
             cursor.execute(sql, params)
             conn.commit()
+            log_db_action(f"Executed SQL: {sql} with params: {params}")
             return
         except OperationalError as e:
             if 'database is locked' in str(e) and attempt < retries - 1:
                 print(f"Database is locked, retrying... ({attempt + 1}/{retries})")
+                log_db_action(f"Database is locked, retrying... ({attempt + 1}/{retries})")
                 await sleep(0.5 * (2 ** attempt))  # Exponential backoff
             else:
+                log_db_action(f"Database error: {e}")
                 raise
 
 async def save_trade(trade):
@@ -557,7 +581,7 @@ async def interpret_message(text):
 def parse_trade_message(details, trade_id):
     try:
         action = details['action']
-        symbol = "XAUUSD+"
+        symbol = "ETHUSD"
         entry_price_low = details['entry_price_low']
         entry_price_high = details['entry_price_high']
         sl = details['sl']
