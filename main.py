@@ -154,9 +154,16 @@ async def get_current_price(account, symbol):
         print(f"Error fetching current price: {e}")
         return None
 
-async def validate_order_parameters(sl, tp1, tp2):
-    if sl <= tp1 or sl <= tp2:
-        raise ValueError("Invalid stop loss or take profit values.")
+async def validate_order_parameters(action, sl, tp1, tp2):
+    if action.lower() == "buy":
+        if sl >= tp1 or sl >= tp2:
+            raise ValueError("Invalid stop loss or take profit values for a buy order.")
+    elif action.lower() == "sell":
+        if sl <= tp1 or sl <= tp2:
+            raise ValueError("Invalid stop loss or take profit values for a sell order.")
+    else:
+        raise ValueError("Invalid action. Must be 'buy' or 'sell'.")
+
 
 async def place_orders(account, trade):
     if not account:
@@ -170,7 +177,7 @@ async def place_orders(account, trade):
         await connection.connect()
         await connection.wait_synchronized()
 
-        await validate_order_parameters(trade.sl, trade.tp1, trade.tp2)
+        await validate_order_parameters(trade.action, trade.sl, trade.tp1, trade.tp2)
 
         current_price = await get_current_price(account, trade.symbol)
         print(f"Current price for {trade.symbol} is {current_price}")
@@ -257,6 +264,7 @@ async def place_additional_market_order(account, trade):
     if (trade.action.lower() == "buy" and (trade.tp1 <= current_price or trade.tp2 <= current_price)) or \
        (trade.action.lower() == "sell" and (trade.tp1 >= current_price or trade.tp2 >= current_price)):
         print("Trade is currently invalid due to price movement. Not placing additional orders.")
+        conn = get_db()
         cursor = conn.cursor()
         cursor.execute('UPDATE entries SET status = ? WHERE trade_id = ? AND order_id IS NULL', ('failed', trade.trade_id))
         conn.commit()
@@ -268,8 +276,8 @@ async def place_additional_market_order(account, trade):
     cursor = conn.cursor()
 
     try:
-        await validate_order_parameters(trade.sl, trade.tp1, trade.tp2)
-        
+        await validate_order_parameters(trade.action, trade.sl, trade.tp1, trade.tp2)
+
         # Pause the order checking process
         global order_checking_paused
         order_checking_paused = True
@@ -296,18 +304,9 @@ async def place_additional_market_order(account, trade):
 
         trade.market1_id = result1['orderId']
 
-        cursor.execute('SELECT id FROM entries WHERE trade_id = ? AND order_id IS NULL LIMIT 1', 
-                       (trade.trade_id,))
-        entry_to_update = cursor.fetchone()
-
-        if entry_to_update:
-            cursor.execute('UPDATE entries SET order_id = ?, order_type = ? WHERE id = ?', 
-                           (result1['orderId'], 'market', entry_to_update['id']))
-            log_db_action(f"Updated entries SET order_id = {result1['orderId']}, order_type = market WHERE id = {entry_to_update['id']}")
-        else:
-            cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
-                           (trade.trade_id, current_price, tp1, sl, volume, 'market', result1['orderId'], 'open'))
-            log_db_action(f"Inserted into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp1}, {sl}, {volume}, market, {result1['orderId']}, open)")
+        cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                       (trade.trade_id, current_price, tp1, sl, volume, 'market', result1['orderId'], 'open'))
+        log_db_action(f"Inserted first market order into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp1}, {sl}, {volume}, market, {result1['orderId']}, open)")
         conn.commit()
 
         # Place second market order with TP2
@@ -331,19 +330,12 @@ async def place_additional_market_order(account, trade):
             return
 
         trade.market2_id = result2['orderId']
-        cursor.execute('SELECT id FROM entries WHERE trade_id = ? AND order_id IS NULL LIMIT 1', 
-                       (trade.trade_id,))
-        entry_to_update = cursor.fetchone()
 
-        if entry_to_update:
-            cursor.execute('UPDATE entries SET order_id = ?, order_type = ? WHERE id = ?', 
-                           (result2['orderId'], 'market', entry_to_update['id']))
-            log_db_action(f"Updated entries SET order_id = {result2['orderId']}, order_type = market WHERE id = {entry_to_update['id']}")
-        else:
-            cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
-                           (trade.trade_id, current_price, tp2, sl, volume, 'market', result2['orderId'], 'open'))
-            log_db_action(f"Inserted into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp2}, {sl}, {volume}, market, {result2['orderId']}, open)")
+        cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                       (trade.trade_id, current_price, tp2, sl, volume, 'market', result2['orderId'], 'open'))
+        log_db_action(f"Inserted second market order into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp2}, {sl}, {volume}, market, {result2['orderId']}, open)")
         conn.commit()
+
         await save_trade(trade)
         print(f"Placed additional market orders: {result1}, {result2}")
     except TradeException as e:
@@ -355,6 +347,7 @@ async def place_additional_market_order(account, trade):
     finally:
         # Resume the order checking process
         order_checking_paused = False
+
 
 async def cancel_all_orders(account, trade):
     connection = account.get_rpc_connection()
