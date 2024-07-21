@@ -253,8 +253,8 @@ async def place_additional_market_order(account, trade):
         return
 
     # Validate that the trade is still viable based on current price and TP values
-    if (trade.action.lower() == "buy" and (trade.tp1 >= current_price or trade.tp2 >= current_price)) or \
-       (trade.action.lower() == "sell" and (trade.tp1 <= current_price or trade.tp2 <= current_price)):
+    if (trade.action.lower() == "buy" and (trade.tp1 <= current_price or trade.tp2 <= current_price)) or \
+       (trade.action.lower() == "sell" and (trade.tp1 >= current_price or trade.tp2 >= current_price)):
         print("Trade is currently invalid due to price movement. Not placing additional orders.")
         cursor = conn.cursor()
         cursor.execute('UPDATE entries SET status = ? WHERE trade_id = ? AND order_id IS NULL', ('failed', trade.trade_id))
@@ -381,7 +381,6 @@ async def check_orders_and_positions(account):
 
             for trade_row in recent_trades:
                 trade_id = trade_row['trade_id']
-                entry_price_low = trade_row['entry_price_low']
                 cursor.execute('SELECT * FROM entries WHERE trade_id = ?', (trade_id,))
                 entries = cursor.fetchall()
 
@@ -445,11 +444,10 @@ async def check_orders_and_positions(account):
 
                 # Check if any position with TP1 is closed
                 positions = await connection.get_positions()
-                tp1_reached = False
                 for pos in positions:
                     for entry in entries:
-                        if entry['tp'] == trade_row['tp1'] and entry['status'] == 'filled' and pos['id'] == entry['order_id']:
-                            if pos['unrealizedProfit'] >= (trade_row['tp1'] - entry_price_low) * pos['volume']:
+                        if entry['tp'] == trade_row['tp1'] and entry['volume'] == 0.02 and entry['order_type'] == 'market':
+                            if entry['status'] == 'closed':
                                 tp1_reached = True
                                 break
                     if tp1_reached:
@@ -483,7 +481,6 @@ async def check_orders_and_positions(account):
             print(f"Error checking orders and positions: {e}")
 
         await sleep(2.5)
-
 
 def default(obj):
     if isinstance(obj, datetime):
