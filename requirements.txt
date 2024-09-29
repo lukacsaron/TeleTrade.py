@@ -1,0 +1,5 @@
+telethon
+openai
+pymongo
+python-dotenv
+pydantic

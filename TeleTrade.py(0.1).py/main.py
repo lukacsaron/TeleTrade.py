@@ -183,6 +183,11 @@ async def place_orders(account, trade):
         print(f"Current price for {trade.symbol} is {current_price}")
 
         for entry in trade.entries:
+            # Skip failed entries with no order_id
+            if entry['status'] == 'failed' and entry['order_id'] is None:
+                print(f"Skipping failed entry: {entry}")
+                continue
+
             entry_price = entry['entry']
             tp = entry['tp']
             sl = entry['sl']
@@ -201,13 +206,9 @@ async def place_orders(account, trade):
                         result = await order_func()
                         if 'orderId' in result:
                             entry['order_id'] = result['orderId']
-                            entry['id'] = entry.get('id', 0)  # Ensure 'id' key is present
+                            entry['status'] = 'open'
                             print(f"Order placed successfully: {result['stringCode']} with order_id: {entry['order_id']}")
-                            cursor.execute('UPDATE entries SET order_id = ?, order_type = ? WHERE id = ?', 
-                                           (entry['order_id'], order_type, entry['id']))
-                            conn.commit()
-                            log_db_action(f"Updated entries SET order_id = {entry['order_id']}, order_type = {order_type} WHERE id = {entry['id']}")
-                            return
+                            return True
                         else:
                             print(f"Order placement failed: {result}")
                     except TradeException as e:
@@ -217,37 +218,45 @@ async def place_orders(account, trade):
                             order_func = alt_order_func
                             order_type = "stop" if order_type == "limit" else "limit"
                         await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                # Mark order as failed if all attempts fail
-                cursor.execute('UPDATE entries SET status = ?, order_type = ? WHERE id = ?', ('failed', order_type, entry['id']))
-                conn.commit()
-                log_db_action(f"Failed to place order after {retries} attempts. Updated entries SET status = failed, order_type = {order_type} WHERE id = {entry['id']}")
+                entry['status'] = 'failed'
+                return False
 
+            order_placed = False
             if trade.action.lower() == "buy":
                 if order_type == "limit":
-                    await place_order(lambda: connection.create_limit_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
-                                      entry, "limit",
-                                      lambda: connection.create_stop_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
+                    order_placed = await place_order(lambda: connection.create_limit_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
+                                                     entry, "limit",
+                                                     lambda: connection.create_stop_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
                 else:
-                    await place_order(lambda: connection.create_stop_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
-                                      entry, "stop",
-                                      lambda: connection.create_limit_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
+                    order_placed = await place_order(lambda: connection.create_stop_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
+                                                     entry, "stop",
+                                                     lambda: connection.create_limit_buy_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
             else:
                 if order_type == "limit":
-                    await place_order(lambda: connection.create_limit_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
-                                      entry, "limit",
-                                      lambda: connection.create_stop_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
+                    order_placed = await place_order(lambda: connection.create_limit_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
+                                                     entry, "limit",
+                                                     lambda: connection.create_stop_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
                 else:
-                    await place_order(lambda: connection.create_stop_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
-                                      entry, "stop",
-                                      lambda: connection.create_limit_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
+                    order_placed = await place_order(lambda: connection.create_stop_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp),
+                                                     entry, "stop",
+                                                     lambda: connection.create_limit_sell_order(trade.symbol, volume, entry_price, stop_loss=sl, take_profit=tp))
 
-        await save_trade(trade)
+            if order_placed:
+                cursor.execute('SELECT COUNT(*) FROM entries WHERE trade_id = ? AND entry = ? AND tp = ? AND sl = ? AND volume = ? AND order_type = ? AND order_id = ? AND status = ?',
+                               (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+                if cursor.fetchone()[0] == 0:
+                    await execute_with_retry('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
+                                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                                             (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+                    conn.commit()
+
         await update_status(trade.trade_id)
         return True
     except Exception as e:
         print(f"Error placing trade: {e}")
         traceback.print_exc()
         return False
+
 
 async def place_additional_market_order(account, trade):
     connection = account.get_rpc_connection()
@@ -271,7 +280,7 @@ async def place_additional_market_order(account, trade):
         log_db_action(f"Trade is currently invalid due to price movement. Updated entries SET status = failed WHERE trade_id = {trade.trade_id} AND order_id IS NULL")
         return
 
-    volume = 0.02
+    volume = 0.05   
     conn = get_db()
     cursor = conn.cursor()
 
@@ -304,9 +313,12 @@ async def place_additional_market_order(account, trade):
 
         trade.market1_id = result1['orderId']
 
-        cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        cursor.execute('SELECT COUNT(*) FROM entries WHERE trade_id = ? AND entry = ? AND tp = ? AND sl = ? AND volume = ? AND order_type = ? AND order_id = ? AND status = ?',
                        (trade.trade_id, current_price, tp1, sl, volume, 'market', result1['orderId'], 'open'))
-        log_db_action(f"Inserted first market order into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp1}, {sl}, {volume}, market, {result1['orderId']}, open)")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                           (trade.trade_id, current_price, tp1, sl, volume, 'market', result1['orderId'], 'open'))
+            log_db_action(f"Inserted first market order into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp1}, {sl}, {volume}, market, {result1['orderId']}, open)")
         conn.commit()
 
         # Place second market order with TP2
@@ -331,10 +343,17 @@ async def place_additional_market_order(account, trade):
 
         trade.market2_id = result2['orderId']
 
-        cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        cursor.execute('SELECT COUNT(*) FROM entries WHERE trade_id = ? AND entry = ? AND tp = ? AND sl = ? AND volume = ? AND order_type = ? AND order_id = ? AND status = ?',
                        (trade.trade_id, current_price, tp2, sl, volume, 'market', result2['orderId'], 'open'))
-        log_db_action(f"Inserted second market order into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp2}, {sl}, {volume}, market, {result2['orderId']}, open)")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute('INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                           (trade.trade_id, current_price, tp2, sl, volume, 'market', result2['orderId'], 'open'))
+            log_db_action(f"Inserted second market order into entries (trade_id, entry, tp, sl, volume, order_type, order_id, status) VALUES ({trade.trade_id}, {current_price}, {tp2}, {sl}, {volume}, market, {result2['orderId']}, open)")
         conn.commit()
+
+        # Ensure market orders are saved correctly
+        trade.entries.append({'entry': current_price, 'tp': tp1, 'sl': sl, 'volume': volume, 'order_type': 'market', 'order_id': result1['orderId'], 'status': 'open'})
+        trade.entries.append({'entry': current_price, 'tp': tp2, 'sl': sl, 'volume': volume, 'order_type': 'market', 'order_id': result2['orderId'], 'status': 'open'})
 
         await save_trade(trade)
         print(f"Placed additional market orders: {result1}, {result2}")
@@ -530,15 +549,22 @@ async def execute_with_retry(sql, params):
                 raise
 
 async def save_trade(trade):
+    conn = get_db()
+    cursor = conn.cursor()
+
     await execute_with_retry('''INSERT OR REPLACE INTO trades (trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, status, market1_id, market2_id)
                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                        (trade.trade_id, trade.action, trade.symbol, trade.entry_price_low, trade.entry_price_high, trade.sl, trade.tp1, trade.tp2, trade.status, trade.market1_id, trade.market2_id))
 
-    await execute_with_retry('DELETE FROM entries WHERE trade_id = ?', (trade.trade_id,))
     for entry in trade.entries:
-        await execute_with_retry('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
-                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                           (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+        cursor.execute('SELECT COUNT(*) FROM entries WHERE trade_id = ? AND entry = ? AND tp = ? AND sl = ? AND volume = ? AND order_type = ? AND order_id = ? AND status = ?',
+                       (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+        if cursor.fetchone()[0] == 0:
+            await execute_with_retry('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
+                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                               (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+    conn.commit()
+
 
 async def update_status(trade_id):
     await execute_with_retry('DELETE FROM status', ())
@@ -574,7 +600,7 @@ async def interpret_message(text):
 def parse_trade_message(details, trade_id):
     try:
         action = details['action']
-        symbol = "ETHUSD"
+        symbol = "XAUUSD+"
         entry_price_low = details['entry_price_low']
         entry_price_high = details['entry_price_high']
         sl = details['sl']
@@ -588,9 +614,9 @@ def parse_trade_message(details, trade_id):
         step = (entry_price_high - entry_price_low) / 11
 
         if action.lower() == "buy":
-            volumes = [0.03] * 4 + [0.02] * 4 + [0.01] * 4
+            volumes = [0.1] * 4 + [0.1] * 4 + [0.05] * 4
         else:
-            volumes = [0.01] * 4 + [0.02] * 4 + [0.03] * 4
+            volumes = [0.05] * 4 + [0.1] * 4 + [0.1] * 4
 
         for i in range(12):
             price = entry_price_low + i * step
