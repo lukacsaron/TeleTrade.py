@@ -131,6 +131,9 @@ client = TelegramClient('session_name', api_id, api_hash)
 # Initialize OpenAI API client
 openai.api_key = openai_api_key
 
+# Define the global variable
+order_checking_paused = False
+
 async def connect_metaapi():
     try:
         print("Connecting to MetaApi...")
@@ -163,7 +166,6 @@ async def validate_order_parameters(action, sl, tp1, tp2):
             raise ValueError("Invalid stop loss or take profit values for a sell order.")
     else:
         raise ValueError("Invalid action. Must be 'buy' or 'sell'.")
-
 
 async def place_orders(account, trade):
     if not account:
@@ -368,25 +370,8 @@ async def place_additional_market_order(account, trade):
         order_checking_paused = False
 
 
-async def cancel_all_orders(account, trade):
-    connection = account.get_rpc_connection()
-    await connection.connect()
-    await connection.wait_synchronized()
-    for entry in trade.entries:
-        if entry['order_id']:
-            await connection.cancel_order(entry['order_id'])
-            entry['status'] = 'closed'
-    if trade.market1_id:
-        await connection.cancel_order(trade.market1_id)
-    if trade.market2_id:
-        await connection.cancel_order(trade.market2_id)
-    trade.status = 'closed'
-    await save_trade(trade)
-    print(f"Cancelled all orders for trade {trade.trade_id}")
-
-order_checking_paused = False
-
 async def check_orders_and_positions(account):
+    global order_checking_paused
     while True:
         if order_checking_paused:
             await sleep(2.5)
@@ -551,12 +536,17 @@ async def execute_with_retry(sql, params):
 async def save_trade(trade):
     conn = get_db()
     cursor = conn.cursor()
+<<<<<<< HEAD:TeleTrade.py(0.1).py/main.py
 
+=======
+    
+>>>>>>> refs/remotes/origin/main:main.py
     await execute_with_retry('''INSERT OR REPLACE INTO trades (trade_id, action, symbol, entry_price_low, entry_price_high, sl, tp1, tp2, status, market1_id, market2_id)
                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                        (trade.trade_id, trade.action, trade.symbol, trade.entry_price_low, trade.entry_price_high, trade.sl, trade.tp1, trade.tp2, trade.status, trade.market1_id, trade.market2_id))
 
     for entry in trade.entries:
+<<<<<<< HEAD:TeleTrade.py(0.1).py/main.py
         cursor.execute('SELECT COUNT(*) FROM entries WHERE trade_id = ? AND entry = ? AND tp = ? AND sl = ? AND volume = ? AND order_type = ? AND order_id = ? AND status = ?',
                        (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
         if cursor.fetchone()[0] == 0:
@@ -565,6 +555,18 @@ async def save_trade(trade):
                                (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
     conn.commit()
 
+=======
+        if entry['order_type'] == 'market':
+            cursor.execute('''INSERT OR IGNORE INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                           (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+        else:
+            await execute_with_retry('''INSERT INTO entries (trade_id, entry, tp, sl, volume, order_type, order_id, status)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                           (trade.trade_id, entry['entry'], entry['tp'], entry['sl'], entry['volume'], entry['order_type'], entry['order_id'], entry['status']))
+    
+    conn.commit()
+>>>>>>> refs/remotes/origin/main:main.py
 
 async def update_status(trade_id):
     await execute_with_retry('DELETE FROM status', ())
