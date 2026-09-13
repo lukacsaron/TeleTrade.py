@@ -2,8 +2,8 @@
 
 Reads trading signals out of Telegram channels, parses the free text with an LLM, and tracks what happened to each trade.
 
-> [!CAUTION]
-> **Do not run this repo as-is.** Earlier commits contain a Telethon `.session` file, which is a live Telegram account credential. See [Security](#security) below. Nothing here is investment advice, and automated order placement against a live broker account loses money fast.
+> [!WARNING]
+> Archived. Nothing here is investment advice, and automated order placement against a live broker account loses money fast. See [Security](#security) for what was cleaned out of this repo's history.
 
 ## The problem
 
@@ -68,21 +68,23 @@ CHANNEL_IDS=       # comma-separated
 LOG_LEVEL=INFO
 ```
 
-Telethon writes `session_name.session` on first login. **That file is a credential. Keep it out of git.**
+Telethon writes `session_name.session` on first login. That file is a credential, equivalent to a logged-in phone. `.gitignore` blocks it. Keep it that way.
 
 The OpenAI call still targets the Completions API with `text-davinci-003`, retired in January 2024. Porting it to the Chat Completions API is the first thing to fix.
 
 ## Security
 
-This repo was private while I was building it and went public later. A cleanup is outstanding:
+This repo was private while I was building it and went public later, carrying things that should never have been committed. History was rewritten on 13 September 2026 to remove them:
 
-- `TeleTrade.py(0.1).py/session_name.session` sits in the current tree, and 23 session blobs across at least three distinct auth keys sit in the history. A Telethon session authenticates as the account without a phone code or a password. Anyone with a clone can use it.
-- The session files cache the channels the account subscribed to.
-- `trades.db`, `trades.json` and `db_log.txt` hold real order history from a live account.
+- **23 Telethon `.session` blobs**, holding at least three distinct 256-byte auth keys. A Telethon session authenticates as the Telegram account with no phone code and no password. Those sessions have been revoked.
+- `trades.db`, `trades.json` and `db_log.txt`, holding real order history from a live account.
+- `status.json`, `__pycache__/` and `.DS_Store`.
 
-No API keys are hardcoded. `config.py` and `main.py` both read from the environment.
+No API keys were ever hardcoded. `config.py` and `main.py` both read from the environment.
 
-**If you cloned this: delete it.** The sessions are being revoked.
+Git history rewrites do not reach forks, and GitHub can serve an unreferenced blob by its SHA for a while after a force-push. Revoking the credential is what actually fixed this; the purge is cleanup. If you cloned this repo before September 2026, delete that clone.
+
+`.gitignore` now blocks `*.session`, the local databases and the log files.
 
 ## License
 
