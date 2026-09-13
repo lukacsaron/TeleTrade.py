@@ -1,1 +1,26 @@
+# Telegram credentials. A .session file authenticates as the account.
+*.session
+*.session-journal
+
+# Secrets
+.env
+.env.*
+!.env.example
 config.json
+
+# Local data
+trades.db
+trades.json
+db_log.txt
+status.json
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
