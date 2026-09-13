@@ -76,7 +76,7 @@ The OpenAI call still targets the Completions API with `text-davinci-003`, retir
 
 This repo was private while I was building it and went public later, carrying things that should never have been committed. History was rewritten on 13 September 2026 to remove them:
 
-- **23 Telethon `.session` blobs**, holding at least three distinct 256-byte auth keys. A Telethon session authenticates as the Telegram account with no phone code and no password. Those sessions have been revoked.
+- **23 Telethon `.session` blobs**, holding at least three distinct 256-byte auth keys. A Telethon session authenticates as the Telegram account with no phone code and no password. Treat every key that was in this history as compromised.
 - `trades.db`, `trades.json` and `db_log.txt`, holding real order history from a live account.
 - `status.json`, `__pycache__/` and `.DS_Store`.
 
